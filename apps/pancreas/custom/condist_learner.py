@@ -1,8 +1,11 @@
 import os
 import json
-from typing import Dict
+import traceback
+from pathlib import Path
+from typing import Dict, Optional
 
 import numpy as np
+from prettytable import PrettyTable
 from torch.utils.tensorboard import SummaryWriter
 from nvflare.apis.dxo import DXO, DataKind, MetaKey, from_shareable
 from nvflare.apis.fl_component import FLComponent
@@ -19,8 +22,8 @@ from utils.model_weights import (
     load_weights,
     extract_weights
 )
-from .trainer import Trainer
-from .validator import Validator
+from trainer import Trainer
+from validator import Validator
 
 class ConDistLearner(Learner):
     def __init__(
@@ -28,6 +31,8 @@ class ConDistLearner(Learner):
         task_config: str,
         data_config: str,
         aggregation_steps: int,
+        seed: Optional[int] = None,
+        max_retry: int = 1,
         train_task_name: str = AppConstants.TASK_TRAIN,
         submit_model_task_name: str = AppConstants.TASK_SUBMIT_MODEL
     ):
@@ -36,6 +41,9 @@ class ConDistLearner(Learner):
         self.task_config = task_config
         self.data_config = data_config
         self.aggregation_steps = aggregation_steps
+
+        self._seed = seed
+        self._max_retry = max_retry
 
         self.train_task_name = train_task_name
         self.submit_model_task_name = submit_model_task_name
@@ -55,6 +63,7 @@ class ConDistLearner(Learner):
         self.key_metric = "val_meandice"
         self.best_metric = -np.inf
         self.best_model_path = "models/best_model.ckpt"
+        self.last_model_path = "models/last.ckpt"
 
         # Create data manager
         self.dm = DataManager(self.app_root, data_config)
@@ -67,7 +76,7 @@ class ConDistLearner(Learner):
         self.validator = Validator(task_config)
 
         # Create logger
-        self.logger = SummaryWriter(log_dir=prefix / "logs")
+        self.tb_logger = SummaryWriter(log_dir=prefix / "logs")
 
     def train(
         self,
@@ -88,28 +97,71 @@ class ConDistLearner(Learner):
         # Create dataset & data loader (if necessary)
         if self.dm.get_data_loader("train") is None:
             self.dm.setup("train")
-
-        # Run training
-        self.trainer.run(
-            self.model,
-            self.dm.get_data_loader("train"),
-            num_steps=self.aggregation_steps,
-            logger=self.logger
-        )
-
-        # Run validation
         if self.dm.get_data_loader("validate") is None:
             self.dm.setup("validate")
 
-        metrics = self.validator.run(
-            self.model,
-            self.dm.get_data_loader("validate")
-        )
+        # Run training
+        for i in range(self._max_retry + 1):
+            try:
+                self.trainer.run(
+                    self.model,
+                    self.dm.get_data_loader("train"),
+                    num_steps=self.aggregation_steps,
+                    logger=self.tb_logger
+                )
+                break
+            except Exception as e:
+                if i < self._max_retry:
+                    self.log_warning(
+                        fl_ctx,
+                        f"Someting wrong in training, retrying ({i+1}/{self._max_retry})."
+                    )
+                    # Restore trainer states to the beginning of the round
+                    if os.path.exists(self.last_model_path):
+                        self.trainer.load_checkpoint(self.last_model_path, self.model)
+                        load_weights(self.model, global_weights)
+                        self.model = self.model.to("cuda:0")
+                    # Reset dataset & dataloader
+                    self.dm._data_loader["train"] = None
+                    self.dm._dataset["train"] = None
+                    self.dm.setup("train")
+                else:
+                    raise RuntimeError(traceback.format_exc())
+
+        # Run validation
+        for i in range(self._max_retry + 1):
+            try:
+                metrics = self.validator.run(
+                    self.model,
+                    self.dm.get_data_loader("validate")
+                )
+                break
+            except Exception as e:
+                if i < self._max_retry:
+                    self.log_warning(
+                        fl_ctx,
+                        f"Someting wrong in training, retrying ({i+1}/{self._max_retry})."
+                    )
+                    # Reset dataset & dataloader
+                    self.dm._data_loader["validate"] = None
+                    self.dm._dataset["validate"] = None
+                    self.dm.setup("validate")
+                else:
+                    raise RuntimeError(traceback.format_exc())
+
+        # Log validation results
+        table = PrettyTable()
+        table.field_names = ["Metric", "Value"]
+        for m, v in metrics.items():
+            table.add_row([m, v])
+            self.tb_logger.add_scalar(m, v, current_round)
+        self.log_info(fl_ctx, str(table))
 
         # Save checkpoint if necessary
         if self.best_metric < metrics[self.key_metric]:
             self.best_metric = metrics[self.key_metric]
             self.trainer.save_checkpoint(self.best_model_path, self.model)
+        self.trainer.save_checkpoint(self.last_model_path, self.model)
 
         # Calculate weight diff
         local_weights = extract_weights(self.model)
@@ -171,14 +223,15 @@ class ConDistLearner(Learner):
         validate_type = data.get_header(AppConstants.VALIDATE_TYPE)
 
         # 2. Prepare dataset
+        phase = None
         if validate_type == ValidateType.BEFORE_TRAIN_VALIDATE:
-            if self.dm.get_data_loader("validate") is None:
-                self.dm.setup("validate")
-            data_loader = self.dm.get_data_loader("validate")
+            phase = "validate"
         elif validate_type == ValidateType.MODEL_VALIDATE:
-            if self.dm.get_data_loader("validate") is None:
-                self.dm.setup("test")
-            data_loader = self.dm.get_data_loader("test")
+            phase = "test"
+
+        if self.dm.get_data_loader(phase) is None:
+            self.dm.setup(phase)
+        data_loader = self.dm.get_data_loader(phase)
 
         # 3. Update model weight
         try:
@@ -196,21 +249,43 @@ class ConDistLearner(Learner):
         load_weights(self.model, dxo.data)
 
         # 4. Run validation
-        metrics = self.validator.run(self.model, data_loader)
+        self.model = self.model.to("cuda:0")
+        for i in range(self._max_retry + 1):
+            try:
+                data_loader = self.dm.get_data_loader(phase)
+                raw_metrics = self.validator.run(self.model, data_loader)
+                break
+            except Exception as e:
+                if i < self._max_retry:
+                    self.log_warning(
+                        fl_ctx,
+                        f"Error encountered in validation, retrying ({i+1}/{self._max_retry})."
+                    )
+                    # Cleanup previous dataset & dataloader
+                    data_loader = None
+                    self.dm._data_loader[phase] = None
+                    self.dm._dataset[phase] = None
+                    # Recreate dataset & dataloader
+                    self.dm.setup(phase)
+                    # Assume both the model & validator are correct
+                else:
+                    raise RuntimeError(traceback.format_exc())
 
         self.log_info(
             fl_ctx,
             f"Validation metrics of {model_owner}'s model on"
-            f" {fl_ctx.get_identity_name()}'s data: {metrics}"
+            f" {fl_ctx.get_identity_name()}'s data: {raw_metrics}"
         )
 
         # For validation before training, only key metric is needed
         if validate_type == ValidateType.BEFORE_TRAIN_VALIDATE:
-            metrics = { MetaKey.INITIAL_METRICS: metrics[self.key_metric] }
+            metrics = { MetaKey.INITIAL_METRICS: raw_metrics[self.key_metric] }
             # Save as best model
-            if self.best_metric < metrics[self.key_metric]:
-                self.best_metric = metrics[self.key_metric]
+            if self.best_metric < raw_metrics[self.key_metric]:
+                self.best_metric = raw_metrics[self.key_metric]
                 self.trainer.save_checkpoint(self.best_model_path, self.model)
+        else:
+            metrics = raw_metrics
 
         # 5. Return results
         dxo = DXO(
@@ -221,5 +296,6 @@ class ConDistLearner(Learner):
 
     def finalize(self, fl_ctx: FLContext):
         self.dm.teardown()
+        self.tb_logger.close()
 
 

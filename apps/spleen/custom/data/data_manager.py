@@ -13,8 +13,8 @@ class DataManager(object):
 
     def _build_dataset(self, stage: str):
         if stage == "train":
-            mode ="train"
-            split ="training"
+            mode = "train"
+            split = "training"
         elif stage == "validate":
             mode = "validate"
             split = "validation"

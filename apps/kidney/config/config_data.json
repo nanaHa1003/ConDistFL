@@ -1,6 +1,6 @@
 {
-  "data_root": "/work/pancreas/nvidia-tlt/dataset/model/multiorgan/KiTS19",
-  "data_list": "/work/pancreas/nvidia-tlt/dataset/model/multiorgan/KiTS19/datalist.json",
+  "data_root": "/raid/Liver/ImageResearch/Segmentation/data/multiorgan/KiTS19",
+  "data_list": "/raid/Liver/ImageResearch/Segmentation/data/multiorgan/KiTS19/datalist.json",
 
   "num_samples": 2,
 

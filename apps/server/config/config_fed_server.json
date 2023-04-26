@@ -103,7 +103,7 @@
     },
     {
       "id": "formatter",
-      "path": "formatter.SimpleFormatter",
+      "path": "simple_formatter.SimpleFormatter",
       "args": {}
     },
     {

@@ -12,7 +12,8 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 from monai.losses import DeepSupervisionLoss
 
-from .losses import ConDistDiceLoss, MarginalDiceCELoss
+from losses import ConDistDiceLoss, MarginalDiceCELoss
+from utils.get_model import get_model
 
 class Trainer(object):
     def __init__(self, task_config: Dict):
@@ -21,13 +22,13 @@ class Trainer(object):
         self.max_rounds = task_config["training"]["max_rounds"]
 
         self.use_half_precision = task_config["training"].get("use_half_precision", False)
-        # self.use_half_precision = True
         self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_half_precision)
 
         num_classes = len(task_config["classes"])
         foreground = task_config["condist_config"]["foreground"]
         background = task_config["condist_config"]["background"]
         temperature = task_config["condist_config"].get("temperature", 2.0)
+        self.model_config = task_config["model"]
         self.weight_range = task_config["condist_config"]["weight_schedule_range"]
 
         self.condist_loss_fn = ConDistDiceLoss(
@@ -44,7 +45,10 @@ class Trainer(object):
             smooth_nr=0.0,
             batch=True
         )
-        self.ds_loss_fn = DeepSupervisionLoss(self.marginal_loss_fn)
+        self.ds_loss_fn = DeepSupervisionLoss(
+            self.marginal_loss_fn,
+            weights=[0.5333, 0.2667, 0.1333, 0.0667]
+        )
 
         self.current_step = 0
         self.current_round = 0
@@ -93,8 +97,7 @@ class Trainer(object):
                 targets = targets[:, 0, ::]
         condist_loss = self.condist_loss_fn(preds[0], targets, label)
 
-        # loss = ds_loss + self.weight * condist_loss
-        loss = ds_loss
+        loss = ds_loss + self.weight * condist_loss
 
         # Log training information
         if self.logger is not None:
@@ -103,6 +106,7 @@ class Trainer(object):
             self.logger.add_scalar("loss_sup", ds_loss, step)
             self.logger.add_scalar("loss_condist", condist_loss, step)
             self.logger.add_scalar("lr", self.sch.get_last_lr()[-1], step)
+            self.logger.add_scalar("condist_weight", self.weight, step)
 
         return loss
 
@@ -117,8 +121,10 @@ class Trainer(object):
             yield batch
 
     def training_loop(self, data_loader: DataLoader, num_steps: int, device: str = "cuda:0"):
+        self.global_model = self.global_model.to(device)
+
         target_step = self.current_step + num_steps
-        with tqdm(total=num_steps) as pbar:
+        with tqdm(total=num_steps, dynamic_ncols=True) as pbar:
             # Configure progress bar
             pbar.set_description(f"Round {self.current_round}")
 
@@ -156,7 +162,10 @@ class Trainer(object):
 
     def setup(self, model: nn.Module, logger: SummaryWriter, abort_signal: Any):
         self.model = model
-        self.global_model = deepcopy(model).eval()
+        # self.global_model = deepcopy(model).eval()
+        self.global_model = get_model(self.model_config)
+        self.global_model.load_state_dict(deepcopy(model.state_dict()))
+        self.global_model.eval()
 
         self.logger = logger
         if abort_signal is not None:
@@ -195,12 +204,12 @@ class Trainer(object):
             "optimizer": self.opt_state,
             "scheduler": self.sch_state
         }
-        torch.save(ckpt, path)
+        torch.save(ckpt, str(path))
 
     def load_checkpoint(self, path: str, model: nn.Module) -> nn.Module:
         ckpt = torch.load(path)
 
-        self.current_step = ckpt.get("round", 0)
+        self.current_step = ckpt.get("global_steps", 0)
         self.current_round = ckpt.get("round", 0)
         self.opt_state = ckpt.get("optimizer", None)
         self.sch_state = ckpt.get("scheduler", None)

@@ -36,7 +36,7 @@
   "training": {
     "lr": 1e-2,
     "max_steps": 120000,
-    "max_rounds": 100,
+    "max_rounds": 240,
 
     "use_half_precision": true
   },

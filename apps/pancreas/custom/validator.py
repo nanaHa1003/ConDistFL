@@ -63,7 +63,7 @@ class Validator(object):
         # Run inference over whole validation set
         with torch.no_grad():
             with torch.cuda.amp.autocast():
-                for batch in tqdm(data_loader, desc="Validation DataLoader"):
+                for batch in tqdm(data_loader, desc="Validation DataLoader", dynamic_ncols=True):
                     self.validate_step(model, batch)
 
         # Collect metrics
